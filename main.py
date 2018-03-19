@@ -16,20 +16,20 @@
 # Command line options are provided by entering the following: python main.py -h
 
 # Imports
-import sqlite3
+import argparse
 import config
+import contextlib
 import csv
 import datetime
-import urllib.request
 import logging
 import re
-import argparse
+import sqlite3
+import urllib.request
 
 logging.basicConfig(filename=config.log_path, format='%(asctime)s [%(levelname)s] %(message)s', level=logging.INFO)
 
 # Returns: datetime projected as YYYY-MM-DD hh:mm:ss, datetime projected as number of seconds since the epoch (1 Jan 1970),
 #          title, author
-# Ordered by date descending then time ascending, i.e. most recent service first but songs in each service appear in order
 # The datetime stored by EasyWorship seems odd - it is the number of 100s of nanoseconds since 21 December 1600. So we divide
 # by 10000000 to get the number of seconds, then subtract a hardcoded number of seconds between 21 Dec 1600 and 1 Jan 1970.
 # Action type 2 is "project" (not sure what the other action types are).
@@ -39,8 +39,7 @@ sql = 'select datetime(datetime_since_epoch, "unixepoch"), datetime_since_epoch,
            from action a \
            join song s \
            on a.song_id = s.rowid \
-           where action_type = 2) \
-       order by date(datetime_since_epoch, "unixepoch") desc, time(datetime_since_epoch, "unixepoch")'
+           where action_type = 2)'
 
 # Convert to a datetime. There seems to have been a data import bug, as the EasyWorship 2007 data has the wrong number of seconds
 # since epoch for times occurring during +0100 GMT. For that data we rely on the datetime string provided by SQLite as it ignores
@@ -61,10 +60,10 @@ def to_service(dt):
             return "9:30am"
         if timeinmins >= 11*60+13 and timeinmins <= 13*60:
             return "11:15am"
-        if timeinmins >= 18*60+28 and timeinmins <= 21*60:  
+        if timeinmins >= 18*60+28 and timeinmins <= 21*60:
             return "6:30pm"
     return None
-    
+
 # Extract the date from a datetime
 def to_date(dt):
     return dt.strftime("%d/%m/%Y")
@@ -81,9 +80,27 @@ def is_in_prefixes_to_ignore(prefixes, title):
 def remove_special_characters(str):
     return re.sub('[^a-zA-Z0-9 ‘’\!\&\(\)\-\.\;\:\,\?\/\']', '', str)
 
+# SQLite collation function for case-insensitive sorting
 def collate_utf8_u_ci(string1, string2):
     return cmp(string1.lower(), string2.lower())
-    
+
+# Read song history from databases specified in configuration file
+def read_songhistory_dbs():
+    rows = []
+    for path in config.songhistory_db_paths:
+        with sqlite3.connect(path, detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+            conn.create_collation("UTF8_U_CI", collate_utf8_u_ci)
+            with contextlib.closing(conn.cursor()) as cur:
+                cur.execute(sql)
+                for row in cur:
+                    dt = to_datetime(row[0], row[1])
+                    rows.append((dt,) + row[2:])
+
+    # Order by date descending then time ascending, i.e. most recent service first but songs in each service appear in order
+    rows.sort(key=lambda row: row[0].time())
+    rows.sort(key=lambda row: row[0].date(), reverse=True)
+    return rows
+
 #----------------------------------------------------------------------------------------------------------------------#
 
 def main():
@@ -97,41 +114,38 @@ def main():
         args = parser.parse_args()
         ignore_prefixes = args.ignore_prefixes
         upload_output_file = args.upload
-    
+
         logging.info("Reading and converting song history")
+
+        # Read song history from database(s)
+        rows = read_songhistory_dbs()
 
         # Open list of song title prefixes to ignore
         if ignore_prefixes:
             with open(config.song_prefixes_path, "r") as prefixesfile:
                 prefixes_to_ignore = prefixesfile.read().splitlines()
-            
+
         # Open database and output file
         with open(config.songhistory_csv_path, "w") as csvfile:
             csvwriter = csv.writer(csvfile, lineterminator="\n")
             csvwriter.writerow(["Date", "Service", "Time Projected", "Title", "Author"])
 
-            # Open connection to database, open a cursor and execute query
-            conn = sqlite3.connect(config.songhistory_db_path, detect_types=sqlite3.PARSE_DECLTYPES)
-            conn.create_collation("UTF8_U_CI", collate_utf8_u_ci)
-            cur = conn.cursor()
-            cur.execute(sql)
-
-            # Retrieve each query row
+            # Iterate through each query row
             previous_date = ""
             previous_service = ""
             songs_for_this_service = set()
             song_count = 0
-            for row in cur:
-                dt = to_datetime(row[0], row[1])
+            for row in rows:
+                dt = row[0]
                 service = to_service(dt)
                 # Only continue if this row is part of a Sunday service
                 if service is not None:
                     # Extract the remaining fields from the query row
                     date = to_date(dt)
                     time = to_time(dt)
-                    title = remove_special_characters(row[2])
-                    author = remove_special_characters(row[3])
-                    
+                    title = remove_special_characters(row[1])
+                    author = remove_special_characters(row[2])
+
                     # Ignore the title if it has no author and is in the list of prefixes to ignore
                     # e.g. It may be a Bible reading or some liturgy rather than a song
                     if ignore_prefixes:
@@ -154,10 +168,6 @@ def main():
                             song_count += 1
                             csvwriter.writerow([date, service, time, title, author])
 
-            # Close the cursor and connection
-            cur.close()
-            conn.close()
-
         # Upload the output file to the web
         if upload_output_file:
             logging.info("Uploading converted song history (" + str(song_count) + " songs)")
@@ -166,7 +176,7 @@ def main():
 
             request = urllib.request.Request(url=config.upload_url, data=file_to_upload, method="PUT")
             response = urllib.request.urlopen(request)
-        
+
             logging.info("Song history uploaded")
         else:
             logging.info("Converted song history (" + str(song_count) + " songs)")
