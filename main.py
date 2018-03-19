@@ -11,6 +11,9 @@
 # 9:28-11:00 (9:30am service), 11:13-13:00 (11:15am service), 18:28-21:00 (6:30pm service).
 #
 # It ignores song titles with certain prefixes (defined in a file), e.g. Bible readings or liturgy.
+# If a song is projected multiple times during a service, only its first projection is written out.
+#
+# Command line options are provided by entering the following: python main.py -h
 
 # Imports
 import sqlite3
@@ -20,17 +23,19 @@ import datetime
 import urllib.request
 import logging
 import re
+import argparse
 
 logging.basicConfig(filename=config.log_path, format='%(asctime)s [%(levelname)s] %(message)s', level=logging.INFO)
 
 # Returns: datetime projected as YYYY-MM-DD hh:mm:ss, datetime projected as number of seconds since the epoch (1 Jan 1970),
-#          song ID, title, author
+#          title, author
 # Ordered by date descending then time ascending, i.e. most recent service first but songs in each service appear in order
 # The datetime stored by EasyWorship seems odd - it is the number of 100s of nanoseconds since 21 December 1600. So we divide
 # by 10000000 to get the number of seconds, then subtract a hardcoded number of seconds between 21 Dec 1600 and 1 Jan 1970.
 # Action type 2 is "project" (not sure what the other action types are).
-sql = 'select datetime(datetime_since_epoch, "unixepoch"), datetime_since_epoch, song_id, title, author from \
-          (select a.date/10000000-11644473600 datetime_since_epoch, s.rowid song_id, s.title, s.author \
+# We used to return song ID, but realised it does not uniquely identify a song (maybe it keeps an edit history).
+sql = 'select datetime(datetime_since_epoch, "unixepoch"), datetime_since_epoch, title, author from \
+          (select a.date/10000000-11644473600 datetime_since_epoch, s.title, s.author \
            from action a \
            join song s \
            on a.song_id = s.rowid \
@@ -75,16 +80,30 @@ def is_in_prefixes_to_ignore(prefixes, title):
 # Remove special characters from the specified string
 def remove_special_characters(str):
     return re.sub('[^a-zA-Z0-9 ‘’\!\&\(\)\-\.\;\:\,\?\/\']', '', str)
+
+def collate_utf8_u_ci(string1, string2):
+    return cmp(string1.lower(), string2.lower())
     
 #----------------------------------------------------------------------------------------------------------------------#
 
 def main():
     try:
+        # Parse command-line arguments
+        parser = argparse.ArgumentParser(description = "Converts the EasyWorship song history into a file, then uploads it.")
+        parser.add_argument("-a, --all-songs", dest="ignore_prefixes", action="store_false", help="include all songs (do not ignore song prefixes)")
+        parser.add_argument("-n, --no-upload", dest="upload", action="store_false", help="do not upload the converted file to the web")
+        parser.set_defaults(ignore_prefixes=True)
+        parser.set_defaults(upload=True)
+        args = parser.parse_args()
+        ignore_prefixes = args.ignore_prefixes
+        upload_output_file = args.upload
+    
         logging.info("Reading and converting song history")
 
         # Open list of song title prefixes to ignore
-        with open(config.song_prefixes_path, "r") as prefixesfile:
-            prefixes_to_ignore = prefixesfile.read().splitlines()
+        if ignore_prefixes:
+            with open(config.song_prefixes_path, "r") as prefixesfile:
+                prefixes_to_ignore = prefixesfile.read().splitlines()
             
         # Open database and output file
         with open(config.songhistory_csv_path, "w") as csvfile:
@@ -93,13 +112,14 @@ def main():
 
             # Open connection to database, open a cursor and execute query
             conn = sqlite3.connect(config.songhistory_db_path, detect_types=sqlite3.PARSE_DECLTYPES)
+            conn.create_collation("UTF8_U_CI", collate_utf8_u_ci)
             cur = conn.cursor()
             cur.execute(sql)
 
             # Retrieve each query row
             previous_date = ""
             previous_service = ""
-            song_ids_for_current_date = set()
+            songs_for_this_service = set()
             song_count = 0
             for row in cur:
                 dt = to_datetime(row[0], row[1])
@@ -109,20 +129,23 @@ def main():
                     # Extract the remaining fields from the query row
                     date = to_date(dt)
                     time = to_time(dt)
-                    song_id = row[2]
-                    title = remove_special_characters(row[3])
-                    author = remove_special_characters(row[4])
+                    title = remove_special_characters(row[2])
+                    author = remove_special_characters(row[3])
                     
                     # Ignore the title if it has no author and is in the list of prefixes to ignore
                     # e.g. It may be a Bible reading or some liturgy rather than a song
-                    ignore_title = (author == "") and is_in_prefixes_to_ignore(prefixes_to_ignore, title)
+                    if ignore_prefixes:
+                        ignore_title = (author == "") and is_in_prefixes_to_ignore(prefixes_to_ignore, title)
+                    else:
+                        ignore_title = False
 
                     if not ignore_title:
                         # Ignore the song if it has already been sung at this service
+                        # Title + author is used to uniquely identify a song (because song ID in the database does not)
                         if previous_date != date or previous_service != service:
-                            song_ids_for_this_service = set()
-                        already_sung_at_this_service = song_id in song_ids_for_this_service
-                        song_ids_for_this_service.add(song_id)
+                            songs_for_this_service = set()
+                        already_sung_at_this_service = (title + author) in songs_for_this_service
+                        songs_for_this_service.add(title + author)
                         previous_date = date
                         previous_service = service
 
@@ -135,16 +158,18 @@ def main():
             cur.close()
             conn.close()
 
-        logging.info("Uploading converted song history (" + str(song_count) + " songs)")
-            
         # Upload the output file to the web
-        with open(config.songhistory_csv_path, "rb") as csvfile:
-            file_to_upload = csvfile.read()
+        if upload_output_file:
+            logging.info("Uploading converted song history (" + str(song_count) + " songs)")
+            with open(config.songhistory_csv_path, "rb") as csvfile:
+                file_to_upload = csvfile.read()
 
-        request = urllib.request.Request(url=config.upload_url, data=file_to_upload, method="PUT")
-        response = urllib.request.urlopen(request)
+            request = urllib.request.Request(url=config.upload_url, data=file_to_upload, method="PUT")
+            response = urllib.request.urlopen(request)
         
-        logging.info("Song history uploaded")
+            logging.info("Song history uploaded")
+        else:
+            logging.info("Converted song history (" + str(song_count) + " songs)")
     except Exception as e:
         logging.exception(e)
 
