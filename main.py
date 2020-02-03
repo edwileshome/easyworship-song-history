@@ -21,10 +21,10 @@ import config
 import contextlib
 import csv
 import datetime
+import dropbox
 import logging
 import re
 import sqlite3
-import urllib.request
 
 logging.basicConfig(filename=config.log_path, format='%(asctime)s [%(levelname)s] %(message)s', level=logging.INFO)
 
@@ -174,8 +174,8 @@ def main():
             with open(config.songhistory_csv_path, "rb") as csvfile:
                 file_to_upload = csvfile.read()
 
-            request = urllib.request.Request(url=config.upload_url, data=file_to_upload, method="PUT")
-            response = urllib.request.urlopen(request)
+			dbx = dropbox.Dropbox(config.dropbox_access_token)
+			dbx.files_upload(file_to_upload, config.songhistory_dropbox_csv_path)
 
             logging.info("Song history uploaded")
         else:
