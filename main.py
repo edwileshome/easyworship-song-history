@@ -174,8 +174,8 @@ def main():
             with open(config.songhistory_csv_path, "rb") as csvfile:
                 file_to_upload = csvfile.read()
 
-			dbx = dropbox.Dropbox(config.dropbox_access_token)
-			dbx.files_upload(file_to_upload, config.songhistory_dropbox_csv_path)
+            dbx = dropbox.Dropbox(config.dropbox_access_token)
+            dbx.files_upload(file_to_upload, config.songhistory_dropbox_csv_path)
 
             logging.info("Song history uploaded")
         else:
