@@ -22,6 +22,7 @@ import contextlib
 import csv
 import datetime
 import dropbox
+import dropbox.files
 import logging
 import re
 import sqlite3
@@ -175,7 +176,7 @@ def main():
                 file_to_upload = csvfile.read()
 
             dbx = dropbox.Dropbox(config.dropbox_access_token)
-            dbx.files_upload(file_to_upload, config.songhistory_dropbox_csv_path)
+            dbx.files_upload(file_to_upload, config.songhistory_dropbox_csv_path, mode=dropbox.files.WriteMode.overwrite)
 
             logging.info("Song history uploaded")
         else:
